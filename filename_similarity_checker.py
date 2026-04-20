@@ -129,6 +129,61 @@ class FilenameSimilarityChecker:
         )
         ext_check.pack(side=tk.LEFT, padx=5)
         
+        # 算法选择
+        algorithm_frame = ttk.Frame(settings_frame)
+        algorithm_frame.pack(fill=tk.X, pady=5)
+        
+        algorithm_label = ttk.Label(algorithm_frame, text="匹配算法：", style="Normal.TLabel")
+        algorithm_label.pack(side=tk.LEFT, padx=5)
+        
+        self.algorithm_mode = tk.StringVar(value="optimized")
+        optimized_radio = ttk.Radiobutton(
+            algorithm_frame, 
+            text="优化算法（O(n log n)，推荐）", 
+            variable=self.algorithm_mode, 
+            value="optimized"
+        )
+        optimized_radio.pack(side=tk.LEFT, padx=20)
+        
+        brute_radio = ttk.Radiobutton(
+            algorithm_frame, 
+            text="暴力算法（O(n²)，精确）", 
+            variable=self.algorithm_mode, 
+            value="brute"
+        )
+        brute_radio.pack(side=tk.LEFT, padx=20)
+        
+        # 重复文件管理阈值百分比设置
+        duplicate_threshold_frame = ttk.Frame(settings_frame)
+        duplicate_threshold_frame.pack(fill=tk.X, pady=10)
+        
+        duplicate_threshold_label = ttk.Label(duplicate_threshold_frame, text="管理阈值百分比：", style="Normal.TLabel")
+        duplicate_threshold_label.pack(side=tk.LEFT, padx=5)
+        
+        self.duplicate_percent_var = tk.DoubleVar(value=100.0)
+        self.duplicate_percent_scale = ttk.Scale(
+            duplicate_threshold_frame, 
+            from_=0.0, 
+            to=100.0, 
+            variable=self.duplicate_percent_var, 
+            orient=tk.HORIZONTAL,
+            length=300,
+            command=self.update_duplicate_threshold_label
+        )
+        self.duplicate_percent_scale.pack(side=tk.LEFT, padx=10)
+        
+        self.duplicate_threshold_value_label = ttk.Label(duplicate_threshold_frame, text="实际：100% (100%)", style="Normal.TLabel")
+        self.duplicate_threshold_value_label.pack(side=tk.LEFT, padx=5)
+        
+        # 说明标签
+        info_label = ttk.Label(
+            duplicate_threshold_frame, 
+            text="（在相似度阈值之上的百分比，如：阈值60%+50%=实际80%）", 
+            style="Normal.TLabel",
+            foreground="#666666"
+        )
+        info_label.pack(side=tk.LEFT, padx=10)
+        
         # 按钮区域
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill=tk.X, pady=10)
@@ -141,6 +196,9 @@ class FilenameSimilarityChecker:
         
         export_btn = ttk.Button(btn_frame, text="导出结果", command=self.export_results)
         export_btn.pack(side=tk.LEFT, padx=10)
+        
+        self.manage_duplicates_btn = ttk.Button(btn_frame, text="管理重复文件", command=self.manage_duplicates)
+        self.manage_duplicates_btn.pack(side=tk.LEFT, padx=10)
         
         # 进度条
         self.progress_var = tk.DoubleVar()
@@ -201,6 +259,20 @@ class FilenameSimilarityChecker:
         """更新阈值显示标签"""
         percentage = float(value) * 100
         self.threshold_value_label.configure(text=f"{percentage:.0f}%")
+        # 同时更新重复文件管理阈值的显示
+        self.update_duplicate_threshold_label(self.duplicate_percent_var.get())
+    
+    def update_duplicate_threshold_label(self, value):
+        """更新重复文件管理阈值显示标签"""
+        percent_value = float(value)
+        base_threshold = self.threshold_var.get() * 100
+        
+        # 计算实际阈值：base_threshold + (100 - base_threshold) * (percent_value / 100)
+        actual_threshold = base_threshold + (100 - base_threshold) * (percent_value / 100)
+        
+        self.duplicate_threshold_value_label.configure(
+            text=f"实际：{actual_threshold:.0f}% ({percent_value:.0f}%)"
+        )
         
     def browse_folder(self):
         """浏览选择文件夹"""
@@ -294,7 +366,16 @@ class FilenameSimilarityChecker:
     def find_similar_groups(self, files):
         """
         找出相似度高的文件并分组
-        使用并查集(Union-Find)算法进行分组
+        根据选择的算法使用不同的匹配策略
+        """
+        if self.algorithm_mode.get() == "optimized":
+            return self.find_similar_groups_optimized(files)
+        else:
+            return self.find_similar_groups_brute(files)
+    
+    def find_similar_groups_brute(self, files):
+        """
+        暴力算法：O(n²)，精确比较所有文件对
         """
         threshold = self.threshold_var.get()
         n = len(files)
@@ -361,6 +442,166 @@ class FilenameSimilarityChecker:
         
         # 按平均相似度降序排序
         result_groups.sort(key=lambda x: x['avg_similarity'], reverse=True)
+        
+        return result_groups
+    
+    def find_similar_groups_optimized(self, files):
+        """
+        优化算法：使用排序 + 滑动窗口，复杂度接近O(n log n)
+        原理：先对文件名排序，相似的文件名在排序后会相邻
+        然后使用滑动窗口只比较相邻的文件，大大减少比较次数
+        """
+        threshold = self.threshold_var.get()
+        n = len(files)
+        
+        # 滑动窗口大小：每个文件只比较前后window_size个文件
+        # 动态调整窗口大小，文件越多窗口越大，但最多不超过20
+        window_size = min(20, max(5, n // 5))
+        
+        # 并查集数据结构
+        parent = list(range(n))
+        
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        
+        def union(x, y):
+            px, py = find(x), find(y)
+            if px != py:
+                parent[py] = px
+        
+        # 第一步：对文件按清理后的名称排序（O(n log n)）
+        # 创建(原始文件名, 清理后文件名, 原始索引)的元组列表
+        indexed_files = []
+        for idx, filename in enumerate(files):
+            clean_name = self.clean_filename(filename)
+            indexed_files.append((filename, clean_name, idx))
+        
+        # 按清理后的名称排序
+        indexed_files.sort(key=lambda x: x[1])
+        
+        # 第二步：使用滑动窗口比较相邻文件
+        # 估算总比较次数：n * window_size
+        total_pairs = n * window_size
+        processed = 0
+        
+        for i in range(n):
+            # 只比较当前文件与前后window_size范围内的文件
+            start_j = max(0, i - window_size)
+            end_j = min(n, i + window_size + 1)
+            
+            for j in range(start_j, end_j):
+                if i >= j:
+                    continue  # 避免重复比较
+                
+                # 获取原始索引
+                orig_i = indexed_files[i][2]
+                orig_j = indexed_files[j][2]
+                
+                # 计算相似度
+                similarity = self.calculate_similarity(files[orig_i], files[orig_j])
+                
+                if similarity >= threshold:
+                    union(orig_i, orig_j)
+                
+                processed += 1
+                progress = (processed / total_pairs) * 100 if total_pairs > 0 else 0
+                self.progress_var.set(progress)
+                self.root.update()
+        
+        # 第三步：额外的n-gram分组策略，确保不会遗漏相似文件
+        # 对于相似度可能较高的文件，使用n-gram进一步分组
+        ngram_groups = self.group_by_ngrams(files, threshold)
+        
+        # 合并n-gram分组的结果到并查集
+        for group in ngram_groups:
+            if len(group) >= 2:
+                for i in range(len(group)):
+                    for j in range(i + 1, len(group)):
+                        union(group[i], group[j])
+        
+        # 按根节点分组
+        groups = defaultdict(list)
+        for i in range(n):
+            root = find(i)
+            groups[root].append(files[i])
+        
+        # 筛选出大小>=2的组，并计算组内相似度
+        result_groups = []
+        for root, members in groups.items():
+            if len(members) >= 2:
+                # 计算组内所有文件对的平均相似度
+                total_sim = 0
+                count = 0
+                for i in range(len(members)):
+                    for j in range(i + 1, len(members)):
+                        sim = self.calculate_similarity(members[i], members[j])
+                        total_sim += sim
+                        count += 1
+                
+                avg_similarity = total_sim / count if count > 0 else 0
+                result_groups.append({
+                    'members': members,
+                    'avg_similarity': avg_similarity,
+                    'size': len(members)
+                })
+        
+        # 按平均相似度降序排序
+        result_groups.sort(key=lambda x: x['avg_similarity'], reverse=True)
+        
+        return result_groups
+    
+    def group_by_ngrams(self, files, threshold):
+        """
+        使用n-gram方法对文件进行分组
+        这是优化算法的补充，用于捕获滑动窗口可能遗漏的相似文件
+        返回：[[原始索引列表], ...]
+        """
+        n = len(files)
+        if n < 2:
+            return []
+        
+        # 选择n-gram的大小，对于短文件名使用2-gram，长文件名使用3-gram
+        def get_ngrams(s, k):
+            """获取字符串的所有k-gram"""
+            if len(s) < k:
+                return [s]
+            return [s[i:i+k] for i in range(len(s) - k + 1)]
+        
+        # 为每个文件生成ngram索引
+        ngram_index = defaultdict(set)  # ngram -> {文件索引}
+        
+        for idx, filename in enumerate(files):
+            clean_name = self.clean_filename(filename)
+            if not clean_name:
+                continue
+            
+            # 选择合适的ngram大小
+            k = 2 if len(clean_name) <= 5 else 3
+            ngrams = get_ngrams(clean_name, k)
+            
+            for gram in ngrams:
+                ngram_index[gram].add(idx)
+        
+        # 计算文件间的ngram重叠分数
+        # 只处理那些共享足够多ngram的文件对
+        candidates = set()
+        
+        for gram, file_indices in ngram_index.items():
+            if len(file_indices) >= 2 and len(file_indices) <= 10:  # 只考虑中等大小的ngram组
+                indices_list = list(file_indices)
+                for i in range(len(indices_list)):
+                    for j in range(i + 1, len(indices_list)):
+                        candidates.add((indices_list[i], indices_list[j]))
+        
+        # 验证候选对的实际相似度
+        result_groups = []
+        for i, j in candidates:
+            similarity = self.calculate_similarity(files[i], files[j])
+            if similarity >= threshold:
+                result_groups.append([i, j])
         
         return result_groups
     
@@ -551,6 +792,433 @@ class FilenameSimilarityChecker:
             
         except Exception as e:
             messagebox.showerror("错误", f"导出结果时发生错误：{str(e)}")
+    
+    def find_duplicates_by_threshold(self, files, threshold):
+        """
+        找出相似度达到指定阈值的文件组
+        参数：
+            files: 文件列表
+            threshold: 相似度阈值 (0.0 - 1.0)
+        返回：[{'members': [文件名列表], 'clean_name': '清理后的文件名', 'avg_similarity': 平均相似度}, ...]
+        """
+        n = len(files)
+        if n < 2:
+            return []
+        
+        # 并查集数据结构
+        parent = list(range(n))
+        
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        
+        def union(x, y):
+            px, py = find(x), find(y)
+            if px != py:
+                parent[py] = px
+        
+        # 第一步：使用优化策略查找相似文件
+        # 1. 先按清理后的名称排序
+        indexed_files = []
+        for idx, filename in enumerate(files):
+            clean_name = self.clean_filename(filename)
+            indexed_files.append((filename, clean_name, idx))
+        
+        indexed_files.sort(key=lambda x: x[1])
+        
+        # 2. 滑动窗口比较
+        window_size = min(20, max(5, n // 5))
+        
+        for i in range(n):
+            start_j = max(0, i - window_size)
+            end_j = min(n, i + window_size + 1)
+            
+            for j in range(start_j, end_j):
+                if i >= j:
+                    continue
+                
+                orig_i = indexed_files[i][2]
+                orig_j = indexed_files[j][2]
+                
+                similarity = self.calculate_similarity(files[orig_i], files[orig_j])
+                
+                if similarity >= threshold:
+                    union(orig_i, orig_j)
+        
+        # 3. 使用n-gram补充查找
+        ngram_groups = self.group_by_ngrams(files, threshold)
+        for group in ngram_groups:
+            if len(group) >= 2:
+                for i in range(len(group)):
+                    for j in range(i + 1, len(group)):
+                        union(group[i], group[j])
+        
+        # 按根节点分组
+        groups = defaultdict(list)
+        for i in range(n):
+            root = find(i)
+            groups[root].append(files[i])
+        
+        # 筛选出大小>=2的组，并计算组内相似度
+        result = []
+        for root, members in groups.items():
+            if len(members) >= 2:
+                # 计算组内所有文件对的平均相似度
+                total_sim = 0
+                count = 0
+                for i in range(len(members)):
+                    for j in range(i + 1, len(members)):
+                        sim = self.calculate_similarity(members[i], members[j])
+                        total_sim += sim
+                        count += 1
+                
+                avg_similarity = total_sim / count if count > 0 else 0
+                
+                # 使用第一个文件的清理名称作为组名
+                clean_name = self.clean_filename(members[0]) if members else ""
+                
+                result.append({
+                    'clean_name': clean_name,
+                    'members': members,
+                    'avg_similarity': avg_similarity,
+                    'size': len(members)
+                })
+        
+        # 按平均相似度降序排序，相似度相同则按文件数量降序
+        result.sort(key=lambda x: (x['avg_similarity'], x['size']), reverse=True)
+        
+        return result
+    
+    def manage_duplicates(self):
+        """管理重复文件（根据自定义阈值）"""
+        if not self.folder_path or not os.path.exists(self.folder_path):
+            messagebox.showwarning("警告", "请先选择一个有效的文件夹")
+            return
+        
+        # 计算实际阈值
+        base_threshold = self.threshold_var.get()
+        percent_value = self.duplicate_percent_var.get() / 100.0
+        
+        # 实际阈值 = 基础阈值 + (1.0 - 基础阈值) * 百分比
+        actual_threshold = base_threshold + (1.0 - base_threshold) * percent_value
+        
+        # 获取文件列表
+        files = self.get_files_in_folder(self.folder_path)
+        
+        if len(files) < 2:
+            messagebox.showinfo("提示", "文件夹中文件数量不足，无法检测重复文件")
+            return
+        
+        # 找出达到阈值的相似文件
+        self.status_label.configure(text=f"正在检测相似度 >= {actual_threshold * 100:.0f}% 的文件...")
+        self.root.update()
+        
+        duplicate_groups = self.find_duplicates_by_threshold(files, actual_threshold)
+        
+        if not duplicate_groups:
+            messagebox.showinfo("提示", f"未发现相似度 >= {actual_threshold * 100:.0f}% 的文件")
+            self.status_label.configure(text="就绪")
+            return
+        
+        # 创建重复文件管理窗口
+        self.create_duplicate_manager_window(duplicate_groups, actual_threshold)
+    
+    def create_duplicate_manager_window(self, duplicate_groups, threshold):
+        """创建重复文件管理窗口"""
+        # 创建新窗口
+        dup_window = tk.Toplevel(self.root)
+        dup_window.title(f"重复文件管理器（相似度 >= {threshold * 100:.0f}%）")
+        dup_window.geometry("800x600")
+        dup_window.resizable(True, True)
+        
+        # 存储选中的文件
+        selected_files = set()
+        
+        # 创建主框架
+        main_frame = ttk.Frame(dup_window, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # 标题和说明
+        title_label = ttk.Label(main_frame, text=f"重复文件管理器（相似度 >= {threshold * 100:.0f}%）", style="Title.TLabel")
+        title_label.pack(pady=(0, 5))
+        
+        info_text = f"共发现 {len(duplicate_groups)} 组相似文件，涉及 {sum(g['size'] for g in duplicate_groups)} 个文件。\n请勾选要删除的文件（每组至少保留一个文件）。"
+        info_label = ttk.Label(main_frame, text=info_text, style="Normal.TLabel")
+        info_label.pack(pady=(0, 10))
+        
+        # 创建带滚动条的画布和框架
+        canvas = tk.Canvas(main_frame)
+        scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # 存储每个组的复选框变量
+        group_vars = []
+        
+        # 显示每个重复文件组
+        for group_idx, group in enumerate(duplicate_groups, 1):
+            members = group['members']
+            clean_name = group['clean_name']
+            avg_sim = group.get('avg_similarity', 1.0)
+            
+            # 组框架
+            group_frame = ttk.LabelFrame(scrollable_frame, text=f"【第 {group_idx} 组】平均相似度：{avg_sim * 100:.1f}% （共 {len(members)} 个文件）", padding="10")
+            group_frame.pack(fill=tk.X, pady=5, padx=5)
+            
+            # 存储该组的复选框变量
+            file_vars = []
+            
+            # 显示每个文件的详细信息
+            for file_idx, filename in enumerate(members):
+                file_path = os.path.join(self.folder_path, filename)
+                
+                # 获取文件信息
+                try:
+                    file_size = os.path.getsize(file_path)
+                    file_size_str = self.format_file_size(file_size)
+                    mod_time = os.path.getmtime(file_path)
+                    from datetime import datetime
+                    mod_time_str = datetime.fromtimestamp(mod_time).strftime("%Y-%m-%d %H:%M:%S")
+                except:
+                    file_size_str = "未知"
+                    mod_time_str = "未知"
+                
+                # 文件框架
+                file_frame = ttk.Frame(group_frame)
+                file_frame.pack(fill=tk.X, pady=2)
+                
+                # 复选框变量
+                var = tk.BooleanVar(value=False)
+                file_vars.append(var)
+                
+                # 复选框
+                cb = ttk.Checkbutton(file_frame, variable=var)
+                cb.pack(side=tk.LEFT, padx=5)
+                
+                # 文件名（突出显示）
+                name_label = ttk.Label(file_frame, text=filename, foreground="#2980b9", font=("TkDefaultFont", 9, "bold"))
+                name_label.pack(side=tk.LEFT, padx=5)
+                
+                # 文件信息
+                info_str = f"大小：{file_size_str} | 修改时间：{mod_time_str}"
+                info_label = ttk.Label(file_frame, text=info_str, foreground="#666666", font=("TkDefaultFont", 8))
+                info_label.pack(side=tk.LEFT, padx=5)
+                
+                # 打开文件位置按钮
+                def open_location(fp=file_path):
+                    import subprocess
+                    folder_path = os.path.dirname(fp)
+                    if os.path.exists(folder_path):
+                        try:
+                            os.startfile(folder_path)
+                        except:
+                            subprocess.run(['explorer', folder_path])
+                
+                open_btn = ttk.Button(file_frame, text="打开位置", width=8, command=open_location)
+                open_btn.pack(side=tk.RIGHT, padx=5)
+            
+            group_vars.append({
+                'group': group,
+                'file_vars': file_vars,
+                'members': members
+            })
+            
+            # 组操作按钮
+            btn_frame = ttk.Frame(group_frame)
+            btn_frame.pack(fill=tk.X, pady=5)
+            
+            # 自动选择辅助函数
+            def select_by_criteria(group_vars_idx=group_idx-1, criteria=None):
+                """根据条件选择文件"""
+                gv = group_vars[group_vars_idx]
+                members = gv['members']
+                file_vars = gv['file_vars']
+                
+                if len(members) < 2:
+                    return
+                
+                # 获取文件信息
+                file_infos = []
+                for idx, filename in enumerate(members):
+                    file_path = os.path.join(self.folder_path, filename)
+                    try:
+                        file_size = os.path.getsize(file_path)
+                        mod_time = os.path.getmtime(file_path)
+                    except:
+                        file_size = 0
+                        mod_time = 0
+                    file_infos.append({
+                        'idx': idx,
+                        'size': file_size,
+                        'mod_time': mod_time,
+                        'filename': filename
+                    })
+                
+                # 根据条件排序
+                if criteria == 'newest':
+                    # 最新的保留，其他选中删除
+                    file_infos.sort(key=lambda x: x['mod_time'], reverse=True)
+                elif criteria == 'oldest':
+                    # 最旧的保留，其他选中删除
+                    file_infos.sort(key=lambda x: x['mod_time'])
+                elif criteria == 'largest':
+                    # 最大的保留，其他选中删除
+                    file_infos.sort(key=lambda x: x['size'], reverse=True)
+                elif criteria == 'smallest':
+                    # 最小的保留，其他选中删除
+                    file_infos.sort(key=lambda x: x['size'])
+                else:
+                    return
+                
+                # 第一个保留（不选中），其他选中删除
+                for i, info in enumerate(file_infos):
+                    if i == 0:
+                        file_vars[info['idx']].set(False)
+                    else:
+                        file_vars[info['idx']].set(True)
+            
+            # 添加快速选择按钮
+            ttk.Button(btn_frame, text="保留最新", width=8, 
+                      command=lambda g=group_idx-1: select_by_criteria(g, 'newest')).pack(side=tk.LEFT, padx=2)
+            ttk.Button(btn_frame, text="保留最旧", width=8,
+                      command=lambda g=group_idx-1: select_by_criteria(g, 'oldest')).pack(side=tk.LEFT, padx=2)
+            ttk.Button(btn_frame, text="保留最大", width=8,
+                      command=lambda g=group_idx-1: select_by_criteria(g, 'largest')).pack(side=tk.LEFT, padx=2)
+            ttk.Button(btn_frame, text="保留最小", width=8,
+                      command=lambda g=group_idx-1: select_by_criteria(g, 'smallest')).pack(side=tk.LEFT, padx=2)
+            ttk.Label(btn_frame, text="← 快速选择", foreground="#666666").pack(side=tk.LEFT, padx=10)
+        
+        # 底部按钮区域
+        bottom_frame = ttk.Frame(main_frame)
+        bottom_frame.pack(fill=tk.X, pady=10)
+        
+        def get_selected_files():
+            """获取所有选中的文件"""
+            selected = []
+            for gv in group_vars:
+                members = gv['members']
+                file_vars = gv['file_vars']
+                for idx, var in enumerate(file_vars):
+                    if var.get():
+                        selected.append(members[idx])
+            return selected
+        
+        def validate_selection():
+            """验证选择是否合法（每组至少保留一个）"""
+            for gv in group_vars:
+                file_vars = gv['file_vars']
+                members = gv['members']
+                selected_count = sum(1 for var in file_vars if var.get())
+                if selected_count >= len(members):
+                    return False, f"第 {group_vars.index(gv) + 1} 组选择了所有文件！每组至少需要保留一个文件。"
+            return True, ""
+        
+        def delete_selected():
+            """删除选中的文件"""
+            # 验证选择
+            valid, message = validate_selection()
+            if not valid:
+                messagebox.showwarning("警告", message)
+                return
+            
+            # 获取选中的文件
+            selected = get_selected_files()
+            
+            if not selected:
+                messagebox.showinfo("提示", "没有选中任何文件")
+                return
+            
+            # 确认删除
+            confirm_msg = f"您确定要删除以下 {len(selected)} 个文件吗？\n此操作不可撤销！\n\n"
+            for filename in selected[:10]:  # 只显示前10个
+                confirm_msg += f"  - {filename}\n"
+            if len(selected) > 10:
+                confirm_msg += f"  ... 还有 {len(selected) - 10} 个文件\n"
+            
+            if not messagebox.askyesno("确认删除", confirm_msg):
+                return
+            
+            # 执行删除
+            deleted = []
+            errors = []
+            
+            for filename in selected:
+                file_path = os.path.join(self.folder_path, filename)
+                try:
+                    os.remove(file_path)
+                    deleted.append(filename)
+                except Exception as e:
+                    errors.append(f"{filename}: {str(e)}")
+            
+            # 显示结果
+            result_msg = ""
+            if deleted:
+                result_msg += f"成功删除 {len(deleted)} 个文件\n"
+            if errors:
+                result_msg += f"删除失败 {len(errors)} 个文件：\n"
+                for err in errors[:5]:
+                    result_msg += f"  - {err}\n"
+                if len(errors) > 5:
+                    result_msg += f"  ... 还有 {len(errors) - 5} 个错误\n"
+            
+            if errors:
+                messagebox.showwarning("删除完成", result_msg)
+            else:
+                messagebox.showinfo("删除完成", result_msg)
+            
+            # 关闭窗口并刷新主界面
+            dup_window.destroy()
+            
+            # 重新检测
+            if self.similar_groups:
+                self.start_check()
+        
+        def select_all_except_one():
+            """全选（每组留一个）"""
+            for gv in group_vars:
+                file_vars = gv['file_vars']
+                for idx, var in enumerate(file_vars):
+                    if idx == 0:
+                        var.set(False)  # 第一个不选
+                    else:
+                        var.set(True)
+        
+        def deselect_all():
+            """取消全选"""
+            for gv in group_vars:
+                for var in gv['file_vars']:
+                    var.set(False)
+        
+        # 底部按钮
+        ttk.Button(bottom_frame, text="全选（每组留一个）", command=select_all_except_one).pack(side=tk.LEFT, padx=5)
+        ttk.Button(bottom_frame, text="取消全选", command=deselect_all).pack(side=tk.LEFT, padx=5)
+        ttk.Button(bottom_frame, text="删除选中的文件", command=delete_selected).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(bottom_frame, text="关闭", command=dup_window.destroy).pack(side=tk.RIGHT, padx=5)
+        
+        # 设置窗口在最前
+        dup_window.transient(self.root)
+        dup_window.grab_set()
+        self.root.wait_window(dup_window)
+    
+    def format_file_size(self, size):
+        """格式化文件大小"""
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if size < 1024.0:
+                return f"{size:.2f} {unit}"
+            size /= 1024.0
+        return f"{size:.2f} PB"
 
 
 def main():
