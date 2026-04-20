@@ -7,6 +7,10 @@
 
 import sys
 import os
+import time
+import threading
+from datetime import timedelta
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import tkinter as tk
@@ -15,7 +19,6 @@ from typing import List, Dict, Any, Optional
 
 from core import FileManager, SimilarityCalculator, get_all_matchers
 from ui.styles import StyleManager
-from ui.duplicate_manager import DuplicateManager
 
 
 class MainWindow:
@@ -30,7 +33,7 @@ class MainWindow:
         """
         self.root = root
         self.root.title("文件名相似度检测工具")
-        self.root.geometry("1000x750")
+        self.root.geometry("1100x800")
         self.root.resizable(True, True)
         
         self.style_manager = StyleManager()
@@ -46,6 +49,10 @@ class MainWindow:
         self.similar_groups: List[Dict[str, Any]] = []
         self.folder_path: str = ""
         
+        self._is_checking = False
+        self._start_time = 0
+        self._timer_job = None
+        
         self._create_widgets()
     
     def _create_widgets(self):
@@ -53,8 +60,19 @@ class MainWindow:
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
         
-        title_label = ttk.Label(main_frame, text="文件名相似度检测工具", style="Title.TLabel")
-        title_label.pack(pady=(0, 10))
+        title_frame = ttk.Frame(main_frame)
+        title_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        title_label = ttk.Label(title_frame, text="文件名相似度检测工具", style="Title.TLabel")
+        title_label.pack(side=tk.LEFT)
+        
+        self._timer_label = ttk.Label(
+            title_frame, 
+            text="", 
+            style="Normal.TLabel",
+            foreground=self.style_manager.get_color('primary')
+        )
+        self._timer_label.pack(side=tk.RIGHT, padx=20)
         
         notebook = ttk.Notebook(main_frame)
         notebook.pack(fill=tk.BOTH, expand=True)
@@ -107,10 +125,12 @@ class MainWindow:
         btn_frame = ttk.Frame(parent)
         btn_frame.pack(fill=tk.X, pady=10)
         
-        ttk.Button(btn_frame, text="开始检测", command=self._start_check).pack(side=tk.LEFT, padx=10)
+        self._start_btn = ttk.Button(btn_frame, text="开始检测", command=self._start_check_async)
+        self._start_btn.pack(side=tk.LEFT, padx=10)
+        
         ttk.Button(btn_frame, text="清空结果", command=self._clear_results).pack(side=tk.LEFT, padx=10)
         ttk.Button(btn_frame, text="导出结果", command=self._export_results).pack(side=tk.LEFT, padx=10)
-        ttk.Button(btn_frame, text="检测相同内容", command=self._check_content_similarity).pack(side=tk.LEFT, padx=10)
+        ttk.Button(btn_frame, text="检测相同内容", command=self._check_content_async).pack(side=tk.LEFT, padx=10)
         
         result_frame = ttk.LabelFrame(parent, text="检测结果（点击文件名查看详细信息）", padding="10")
         result_frame.pack(fill=tk.BOTH, expand=True, pady=5)
@@ -167,6 +187,17 @@ class MainWindow:
             variable=self.algorithm_mode,
             value='brute'
         ).pack(anchor=tk.W, pady=2)
+        
+        est_frame = ttk.LabelFrame(parent, text="预计时长参考", padding="5")
+        est_frame.pack(fill=tk.X, pady=5)
+        
+        self._est_time_label = ttk.Label(
+            est_frame, 
+            text="选择文件夹后显示预计时长", 
+            style="Small.TLabel",
+            foreground="#666666"
+        )
+        self._est_time_label.pack(anchor=tk.W)
     
     def _create_right_settings(self, parent: ttk.Frame):
         """创建设置面板右侧内容"""
@@ -215,6 +246,241 @@ class MainWindow:
             text="在结果中显示文件详细信息",
             variable=self.show_file_info
         ).pack(anchor=tk.W, pady=2)
+    
+    def _estimate_time(self, file_count: int, algorithm: str) -> str:
+        """
+        估算检测时长
+        
+        Args:
+            file_count: 文件数量
+            algorithm: 算法类型
+            
+        Returns:
+            预计时长字符串
+        """
+        if file_count < 10:
+            return "预计几秒内完成"
+        
+        if algorithm == 'optimized':
+            estimated_ms = file_count * 2
+        else:
+            estimated_ms = (file_count * file_count) / 100
+        
+        estimated_ms = max(estimated_ms, 100)
+        
+        if estimated_ms < 1000:
+            return f"预计约 {int(estimated_ms)} 毫秒"
+        elif estimated_ms < 60000:
+            return f"预计约 {estimated_ms/1000:.1f} 秒"
+        else:
+            minutes = estimated_ms / 60000
+            return f"预计约 {minutes:.1f} 分钟"
+    
+    def _update_estimated_time(self):
+        """更新预计时长显示"""
+        if not hasattr(self, '_est_time_label'):
+            return
+        
+        if not self.folder_path or not os.path.exists(self.folder_path):
+            self._est_time_label.configure(text="选择文件夹后显示预计时长")
+            return
+        
+        try:
+            files = self.file_manager.get_files_in_folder(self.folder_path)
+            file_count = len(files)
+            
+            if file_count < 2:
+                self._est_time_label.configure(text="文件数量不足，无法检测")
+                return
+            
+            algorithm = self.algorithm_mode.get()
+            est_time = self._estimate_time(file_count, algorithm)
+            algo_name = "优化算法" if algorithm == 'optimized' else "暴力算法"
+            
+            self._est_time_label.configure(
+                text=f"共 {file_count} 个文件，{algo_name}，{est_time}"
+            )
+        except:
+            self._est_time_label.configure(text="无法计算预计时长")
+    
+    def _start_timer(self):
+        """开始计时"""
+        self._start_time = time.time()
+        self._update_timer()
+    
+    def _update_timer(self):
+        """更新计时器显示"""
+        if not self._is_checking:
+            return
+        
+        elapsed = time.time() - self._start_time
+        elapsed_str = str(timedelta(seconds=int(elapsed)))
+        
+        if elapsed > 0 and self.progress_var.get() > 0:
+            progress = self.progress_var.get() / 100
+            if progress > 0:
+                remaining = elapsed / progress - elapsed
+                remaining_str = str(timedelta(seconds=int(remaining)))
+                self._timer_label.configure(
+                    text=f"已用：{elapsed_str} | 剩余：约 {remaining_str}"
+                )
+            else:
+                self._timer_label.configure(text=f"已用：{elapsed_str}")
+        else:
+            self._timer_label.configure(text=f"已用：{elapsed_str}")
+        
+        self._timer_job = self.root.after(100, self._update_timer)
+    
+    def _stop_timer(self):
+        """停止计时"""
+        self._is_checking = False
+        if self._timer_job:
+            self.root.after_cancel(self._timer_job)
+            self._timer_job = None
+        
+        elapsed = time.time() - self._start_time
+        elapsed_str = str(timedelta(seconds=int(elapsed)))
+        self._timer_label.configure(text=f"总用时：{elapsed_str}")
+    
+    def _start_check_async(self):
+        """异步开始检测"""
+        if self._is_checking:
+            return
+        
+        if not self.folder_path or not os.path.exists(self.folder_path):
+            messagebox.showwarning("警告", "请先选择一个有效的文件夹")
+            return
+        
+        try:
+            files = self.file_manager.get_files_in_folder(self.folder_path)
+            if len(files) < 2:
+                messagebox.showinfo("提示", "文件夹中文件数量不足，无法进行相似度检测")
+                return
+        except Exception as e:
+            messagebox.showerror("错误", str(e))
+            return
+        
+        self._is_checking = True
+        self._start_btn.configure(state='disabled', text="检测中...")
+        self._start_timer()
+        
+        self.result_text.delete(1.0, tk.END)
+        self._clear_file_info()
+        self.progress_var.set(0)
+        self.status_label.configure(text=f"共发现 {len(files)} 个文件，正在检测相似度...")
+        
+        thread = threading.Thread(target=self._do_check, args=(files,), daemon=True)
+        thread.start()
+    
+    def _do_check(self, files: List[str]):
+        """执行检测（在线程中）"""
+        try:
+            self.similarity_calculator.include_extension = self.include_extension.get()
+            
+            def progress_callback(progress: float):
+                self.progress_var.set(progress)
+                self.root.update_idletasks()
+            
+            self.similar_groups = self.similarity_calculator.find_groups(
+                files,
+                algorithm=self.algorithm_mode.get(),
+                progress_callback=progress_callback
+            )
+            
+            self.root.after(0, self._check_completed)
+        except Exception as e:
+            self.root.after(0, lambda: self._check_failed(str(e)))
+    
+    def _check_completed(self):
+        """检测完成"""
+        self._stop_timer()
+        self._start_btn.configure(state='normal', text="开始检测")
+        self._is_checking = False
+        
+        self._display_results()
+        self.progress_var.set(100)
+        
+        all_matchers = get_all_matchers()
+        matcher_name = self.matcher_type.get()
+        for m in all_matchers:
+            if m[0] == matcher_name:
+                matcher_name = m[1]
+                break
+        
+        threshold_text = f"{self.threshold_var.get() * 100:.0f}%"
+        self.status_label.configure(
+            text=f"检测完成！发现 {len(self.similar_groups)} 组相似文件（{matcher_name}，阈值：{threshold_text}）"
+        )
+    
+    def _check_failed(self, error_msg: str):
+        """检测失败"""
+        self._stop_timer()
+        self._start_btn.configure(state='normal', text="开始检测")
+        self._is_checking = False
+        self._timer_label.configure(text="")
+        
+        messagebox.showerror("错误", f"检测过程中发生错误：{error_msg}")
+        self.status_label.configure(text="检测失败")
+    
+    def _check_content_async(self):
+        """异步检测相同内容"""
+        if self._is_checking:
+            return
+        
+        if not self.folder_path or not os.path.exists(self.folder_path):
+            messagebox.showwarning("警告", "请先选择一个有效的文件夹")
+            return
+        
+        try:
+            files = self.file_manager.get_files_in_folder(self.folder_path)
+            if len(files) < 2:
+                messagebox.showinfo("提示", "文件夹中文件数量不足")
+                return
+        except Exception as e:
+            messagebox.showerror("错误", str(e))
+            return
+        
+        self._is_checking = True
+        self._start_btn.configure(state='disabled', text="检测中...")
+        self._start_timer()
+        
+        self.result_text.delete(1.0, tk.END)
+        self._clear_file_info()
+        self.progress_var.set(0)
+        self.status_label.configure(text="正在读取文件内容并计算哈希...")
+        
+        thread = threading.Thread(target=self._do_check_content, args=(files,), daemon=True)
+        thread.start()
+    
+    def _do_check_content(self, files: List[str]):
+        """执行内容检测（在线程中）"""
+        try:
+            def progress_callback(progress: float):
+                self.progress_var.set(progress)
+                self.root.update_idletasks()
+            
+            self.similar_groups = self.similarity_calculator.find_groups_by_content(
+                self.folder_path,
+                files,
+                progress_callback=progress_callback
+            )
+            
+            self.root.after(0, self._check_content_completed)
+        except Exception as e:
+            self.root.after(0, lambda: self._check_failed(str(e)))
+    
+    def _check_content_completed(self):
+        """内容检测完成"""
+        self._stop_timer()
+        self._start_btn.configure(state='normal', text="开始检测")
+        self._is_checking = False
+        
+        self._display_content_results()
+        self.progress_var.set(100)
+        
+        self.status_label.configure(
+            text=f"内容检测完成！发现 {len(self.similar_groups)} 组内容相同的文件"
+        )
     
     def _create_result_display(self, parent: ttk.Frame):
         """创建结果显示区域"""
@@ -343,42 +609,34 @@ class MainWindow:
         ttk.Button(btn_frame, text="打开位置", command=open_location).pack(side=tk.LEFT, padx=2)
     
     def _create_manage_tab(self, parent: ttk.Frame):
-        """创建重复文件管理标签页"""
-        description = ttk.Label(
-            parent,
-            text="此功能用于管理相似度较高的文件，可以自动选择并删除重复文件。\n"
-                 "请先在「相似度检测」标签页中选择文件夹并设置好参数。",
-            style="Normal.TLabel"
-        )
-        description.pack(pady=20)
-        
+        """创建重复文件管理标签页（整合版）"""
         settings_frame = ttk.LabelFrame(parent, text="管理设置", padding="10")
-        settings_frame.pack(fill=tk.X, pady=10, padx=20)
+        settings_frame.pack(fill=tk.X, pady=5)
         
         threshold_frame = ttk.Frame(settings_frame)
         threshold_frame.pack(fill=tk.X, pady=5)
         
         ttk.Label(threshold_frame, text="管理阈值百分比：", style="Normal.TLabel").pack(side=tk.LEFT, padx=5)
         
-        self.duplicate_percent_var = tk.DoubleVar(value=100.0)
+        self.manage_percent_var = tk.DoubleVar(value=100.0)
         
-        self.duplicate_percent_scale = ttk.Scale(
+        self.manage_percent_scale = ttk.Scale(
             threshold_frame,
             from_=0.0,
             to=100.0,
-            variable=self.duplicate_percent_var,
+            variable=self.manage_percent_var,
             orient=tk.HORIZONTAL,
             length=300,
-            command=self._update_duplicate_threshold_label
+            command=self._update_manage_threshold_label
         )
-        self.duplicate_percent_scale.pack(side=tk.LEFT, padx=10)
+        self.manage_percent_scale.pack(side=tk.LEFT, padx=10)
         
-        self.duplicate_threshold_value_label = ttk.Label(
+        self.manage_threshold_value_label = ttk.Label(
             threshold_frame, 
             text="实际：100% (100%)", 
             style="Normal.TLabel"
         )
-        self.duplicate_threshold_value_label.pack(side=tk.LEFT, padx=5)
+        self.manage_threshold_value_label.pack(side=tk.LEFT, padx=5)
         
         info_label = ttk.Label(
             settings_frame,
@@ -387,17 +645,503 @@ class MainWindow:
             style="Small.TLabel",
             foreground="#666666"
         )
-        info_label.pack(anchor=tk.W, pady=10)
+        info_label.pack(anchor=tk.W, pady=5)
         
         btn_frame = ttk.Frame(parent)
-        btn_frame.pack(pady=20)
+        btn_frame.pack(fill=tk.X, pady=10)
+        
+        self._load_manage_btn = ttk.Button(
+            btn_frame, 
+            text="加载相似文件", 
+            command=self._load_manage_groups
+        )
+        self._load_manage_btn.pack(side=tk.LEFT, padx=5)
         
         ttk.Button(
             btn_frame, 
-            text="打开重复文件管理器", 
-            command=self._open_duplicate_manager,
-            width=25
-        ).pack()
+            text="全选（每组留一个）", 
+            command=self._manage_select_all_except_one
+        ).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(
+            btn_frame, 
+            text="取消全选", 
+            command=self._manage_deselect_all
+        ).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(
+            btn_frame, 
+            text="删除选中的文件", 
+            command=self._manage_delete_selected
+        ).pack(side=tk.RIGHT, padx=5)
+        
+        self._manage_status_label = ttk.Label(
+            btn_frame,
+            text="请先选择文件夹并设置参数，然后点击「加载相似文件」",
+            style="Small.TLabel",
+            foreground="#666666"
+        )
+        self._manage_status_label.pack(side=tk.LEFT, padx=20)
+        
+        content_frame = ttk.Frame(parent)
+        content_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        paned_window = ttk.PanedWindow(content_frame, orient=tk.HORIZONTAL)
+        paned_window.pack(fill=tk.BOTH, expand=True)
+        
+        list_frame = ttk.Frame(paned_window)
+        paned_window.add(list_frame, weight=3)
+        
+        detail_frame = ttk.LabelFrame(paned_window, text="文件详细信息", padding="5")
+        paned_window.add(detail_frame, weight=1)
+        
+        canvas = tk.Canvas(list_frame)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
+        self._manage_scrollable_frame = ttk.Frame(canvas)
+        
+        self._manage_scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=self._manage_scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        self._manage_groups: List[Dict[str, Any]] = []
+        self._manage_group_vars: List[Dict[str, Any]] = []
+        
+        self._create_manage_detail_panel(detail_frame)
+        self._clear_manage_display()
+    
+    def _create_manage_detail_panel(self, parent: ttk.Frame):
+        """创建管理标签页的详情面板"""
+        canvas = tk.Canvas(parent)
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        self._manage_detail_frame = ttk.Frame(canvas)
+        
+        self._manage_detail_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=self._manage_detail_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        self._clear_manage_detail()
+    
+    def _clear_manage_detail(self):
+        """清空管理详情面板"""
+        for widget in self._manage_detail_frame.winfo_children():
+            widget.destroy()
+        
+        ttk.Label(
+            self._manage_detail_frame,
+            text="勾选文件复选框\n查看文件详细信息",
+            style="Normal.TLabel",
+            foreground="#666666"
+        ).pack(pady=20)
+    
+    def _clear_manage_display(self):
+        """清空管理显示"""
+        for widget in self._manage_scrollable_frame.winfo_children():
+            widget.destroy()
+        
+        ttk.Label(
+            self._manage_scrollable_frame,
+            text="请点击「加载相似文件」按钮\n查看相似度较高的文件组",
+            style="Normal.TLabel",
+            foreground="#666666"
+        ).pack(pady=50)
+    
+    def _update_manage_threshold_label(self, value):
+        """更新管理阈值显示"""
+        percent_value = float(value)
+        base_threshold = self.threshold_var.get() * 100
+        
+        actual_threshold = base_threshold + (100 - base_threshold) * (percent_value / 100)
+        
+        self.manage_threshold_value_label.configure(
+            text=f"实际：{actual_threshold:.0f}% ({percent_value:.0f}%)"
+        )
+    
+    def _load_manage_groups(self):
+        """加载相似文件组到管理面板"""
+        if not self.folder_path or not os.path.exists(self.folder_path):
+            messagebox.showwarning("警告", "请先在「相似度检测」标签页选择一个有效的文件夹")
+            return
+        
+        base_threshold = self.threshold_var.get()
+        percent_value = self.manage_percent_var.get() / 100.0
+        actual_threshold = base_threshold + (1.0 - base_threshold) * percent_value
+        
+        try:
+            files = self.file_manager.get_files_in_folder(self.folder_path)
+        except Exception as e:
+            messagebox.showerror("错误", f"读取文件夹时出错：{str(e)}")
+            return
+        
+        if len(files) < 2:
+            messagebox.showinfo("提示", "文件夹中文件数量不足")
+            return
+        
+        self._load_manage_btn.configure(state='disabled', text="加载中...")
+        self._manage_status_label.configure(text=f"正在检测相似度 >= {actual_threshold * 100:.0f}% 的文件...")
+        self.root.update()
+        
+        def progress_callback(progress: float):
+            self._manage_status_label.configure(text=f"加载中... {progress:.0f}%")
+            self.root.update_idletasks()
+        
+        self._manage_groups = self.similarity_calculator.find_duplicates_by_threshold(
+            files,
+            actual_threshold,
+            progress_callback=progress_callback
+        )
+        
+        if not self._manage_groups:
+            messagebox.showinfo("提示", f"未发现相似度 >= {actual_threshold * 100:.0f}% 的文件")
+            self._load_manage_btn.configure(state='normal', text="加载相似文件")
+            self._manage_status_label.configure(text="未找到符合条件的文件")
+            return
+        
+        self._display_manage_groups()
+        self._load_manage_btn.configure(state='normal', text="加载相似文件")
+        
+        total_files = sum(g['size'] for g in self._manage_groups)
+        self._manage_status_label.configure(
+            text=f"共发现 {len(self._manage_groups)} 组相似文件，涉及 {total_files} 个文件"
+        )
+    
+    def _display_manage_groups(self):
+        """显示管理文件组"""
+        self._manage_group_vars = []
+        
+        for widget in self._manage_scrollable_frame.winfo_children():
+            widget.destroy()
+        
+        for group_idx, group in enumerate(self._manage_groups, 1):
+            members = group['members']
+            clean_name = group.get('clean_name', '')
+            avg_sim = group.get('avg_similarity', 1.0)
+            
+            group_frame = ttk.LabelFrame(
+                self._manage_scrollable_frame,
+                text=f"【第 {group_idx} 组】平均相似度：{avg_sim * 100:.1f}% （共 {len(members)} 个文件）",
+                padding="10"
+            )
+            group_frame.pack(fill=tk.X, pady=5, padx=5)
+            
+            file_vars = []
+            
+            for file_idx, filename in enumerate(members):
+                file_path = os.path.join(self.folder_path, filename)
+                info = self.file_manager.get_file_info(file_path)
+                
+                file_frame = ttk.Frame(group_frame)
+                file_frame.pack(fill=tk.X, pady=2)
+                
+                var = tk.BooleanVar(value=False)
+                file_vars.append(var)
+                
+                def make_on_check(v=var, fn=filename):
+                    def _on_check():
+                        if v.get():
+                            self._display_manage_file_detail(fn)
+                    return _on_check
+                
+                cb = ttk.Checkbutton(file_frame, variable=var, command=make_on_check())
+                cb.pack(side=tk.LEFT, padx=5)
+                
+                name_label = ttk.Label(
+                    file_frame,
+                    text=filename,
+                    foreground=self.style_manager.get_color('primary'),
+                    font=self.style_manager.get_font('bold')
+                )
+                name_label.pack(side=tk.LEFT, padx=5)
+                
+                info_str = f"大小：{info['size_str']} | 修改：{info['modified_time_str']}"
+                info_label = ttk.Label(
+                    file_frame,
+                    text=info_str,
+                    foreground=self.style_manager.get_color('text_secondary'),
+                    font=self.style_manager.get_font('small')
+                )
+                info_label.pack(side=tk.LEFT, padx=5)
+                
+                def make_open_location(fp=file_path):
+                    def _open():
+                        folder = os.path.dirname(fp)
+                        self.file_manager.open_folder(folder)
+                    return _open
+                
+                open_btn = ttk.Button(file_frame, text="打开位置", width=8, command=make_open_location())
+                open_btn.pack(side=tk.RIGHT, padx=5)
+            
+            self._manage_group_vars.append({
+                'group': group,
+                'file_vars': file_vars,
+                'members': members
+            })
+            
+            btn_frame = ttk.Frame(group_frame)
+            btn_frame.pack(fill=tk.X, pady=5)
+            
+            def make_select_by_criteria(g_idx=group_idx-1):
+                def _select(criteria):
+                    self._manage_select_by_criteria(g_idx, criteria)
+                return _select
+            
+            ttk.Button(
+                btn_frame, 
+                text="保留最新", 
+                width=8,
+                command=lambda g=group_idx-1: self._manage_select_by_criteria(g, 'newest')
+            ).pack(side=tk.LEFT, padx=2)
+            
+            ttk.Button(
+                btn_frame,
+                text="保留最旧",
+                width=8,
+                command=lambda g=group_idx-1: self._manage_select_by_criteria(g, 'oldest')
+            ).pack(side=tk.LEFT, padx=2)
+            
+            ttk.Button(
+                btn_frame,
+                text="保留最大",
+                width=8,
+                command=lambda g=group_idx-1: self._manage_select_by_criteria(g, 'largest')
+            ).pack(side=tk.LEFT, padx=2)
+            
+            ttk.Button(
+                btn_frame,
+                text="保留最小",
+                width=8,
+                command=lambda g=group_idx-1: self._manage_select_by_criteria(g, 'smallest')
+            ).pack(side=tk.LEFT, padx=2)
+            
+            ttk.Label(
+                btn_frame,
+                text="← 快速选择",
+                foreground=self.style_manager.get_color('muted')
+            ).pack(side=tk.LEFT, padx=10)
+    
+    def _display_manage_file_detail(self, filename: str):
+        """
+        显示管理标签页中的文件详情
+        
+        Args:
+            filename: 文件名
+        """
+        file_path = os.path.join(self.folder_path, filename)
+        info = self.file_manager.get_file_info(file_path)
+        
+        for widget in self._manage_detail_frame.winfo_children():
+            widget.destroy()
+        
+        ttk.Label(
+            self._manage_detail_frame,
+            text=info['name'],
+            style="Heading.TLabel",
+            foreground=self.style_manager.get_color('primary')
+        ).pack(anchor=tk.W, pady=(0, 10))
+        
+        info_items = [
+            ("文件路径", info['path']),
+            ("文件大小", info['size_str']),
+            ("扩展名", info['extension'] if info['extension'] else "无"),
+            ("创建时间", info['created_time_str'] if info['created_time_str'] else "未知"),
+            ("修改时间", info['modified_time_str'] if info['modified_time_str'] else "未知"),
+        ]
+        
+        for label, value in info_items:
+            item_frame = ttk.Frame(self._manage_detail_frame)
+            item_frame.pack(fill=tk.X, pady=2)
+            
+            ttk.Label(
+                item_frame,
+                text=f"{label}：",
+                style="Small.TLabel",
+                width=10
+            ).pack(side=tk.LEFT)
+            
+            value_label = ttk.Label(
+                item_frame,
+                text=str(value),
+                style="Small.TLabel",
+                foreground=self.style_manager.get_color('text_primary'),
+                wraplength=200
+            )
+            value_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        ttk.Separator(self._manage_detail_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
+        
+        btn_frame = ttk.Frame(self._manage_detail_frame)
+        btn_frame.pack(fill=tk.X, pady=5)
+        
+        def open_location():
+            folder = os.path.dirname(file_path)
+            self.file_manager.open_folder(folder)
+        
+        def open_file():
+            if os.path.exists(file_path):
+                try:
+                    os.startfile(file_path)
+                except:
+                    pass
+        
+        ttk.Button(btn_frame, text="打开文件", command=open_file).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="打开位置", command=open_location).pack(side=tk.LEFT, padx=2)
+    
+    def _manage_select_by_criteria(self, group_vars_idx: int, criteria: str):
+        """
+        根据条件选择文件
+        
+        Args:
+            group_vars_idx: 组索引
+            criteria: 选择条件
+        """
+        if group_vars_idx >= len(self._manage_group_vars):
+            return
+        
+        gv = self._manage_group_vars[group_vars_idx]
+        members = gv['members']
+        file_vars = gv['file_vars']
+        
+        if len(members) < 2:
+            return
+        
+        file_infos = []
+        for idx, filename in enumerate(members):
+            file_path = os.path.join(self.folder_path, filename)
+            try:
+                file_size = os.path.getsize(file_path)
+                mod_time = os.path.getmtime(file_path)
+            except:
+                file_size = 0
+                mod_time = 0
+            file_infos.append({
+                'idx': idx,
+                'size': file_size,
+                'mod_time': mod_time,
+                'filename': filename
+            })
+        
+        if criteria == 'newest':
+            file_infos.sort(key=lambda x: x['mod_time'], reverse=True)
+        elif criteria == 'oldest':
+            file_infos.sort(key=lambda x: x['mod_time'])
+        elif criteria == 'largest':
+            file_infos.sort(key=lambda x: x['size'], reverse=True)
+        elif criteria == 'smallest':
+            file_infos.sort(key=lambda x: x['size'])
+        else:
+            return
+        
+        for i, info in enumerate(file_infos):
+            if i == 0:
+                file_vars[info['idx']].set(False)
+            else:
+                file_vars[info['idx']].set(True)
+    
+    def _manage_get_selected_files(self) -> List[str]:
+        """获取管理面板中选中的文件"""
+        selected = []
+        for gv in self._manage_group_vars:
+            members = gv['members']
+            file_vars = gv['file_vars']
+            for idx, var in enumerate(file_vars):
+                if var.get():
+                    selected.append(members[idx])
+        return selected
+    
+    def _manage_validate_selection(self) -> tuple:
+        """验证管理面板选择是否合法"""
+        for gv in self._manage_group_vars:
+            file_vars = gv['file_vars']
+            members = gv['members']
+            selected_count = sum(1 for var in file_vars if var.get())
+            if selected_count >= len(members):
+                return False, f"第 {self._manage_group_vars.index(gv) + 1} 组选择了所有文件！每组至少需要保留一个文件。"
+        return True, ""
+    
+    def _manage_select_all_except_one(self):
+        """全选（每组留一个）"""
+        for gv in self._manage_group_vars:
+            file_vars = gv['file_vars']
+            for idx, var in enumerate(file_vars):
+                if idx == 0:
+                    var.set(False)
+                else:
+                    var.set(True)
+    
+    def _manage_deselect_all(self):
+        """取消全选"""
+        for gv in self._manage_group_vars:
+            for var in gv['file_vars']:
+                var.set(False)
+        self._clear_manage_detail()
+    
+    def _manage_delete_selected(self):
+        """删除选中的文件"""
+        valid, message = self._manage_validate_selection()
+        if not valid:
+            messagebox.showwarning("警告", message)
+            return
+        
+        selected = self._manage_get_selected_files()
+        
+        if not selected:
+            messagebox.showinfo("提示", "没有选中任何文件")
+            return
+        
+        confirm_msg = f"您确定要删除以下 {len(selected)} 个文件吗？\n此操作不可撤销！\n\n"
+        for filename in selected[:10]:
+            confirm_msg += f"  - {filename}\n"
+        if len(selected) > 10:
+            confirm_msg += f"  ... 还有 {len(selected) - 10} 个文件\n"
+        
+        if not messagebox.askyesno("确认删除", confirm_msg):
+            return
+        
+        deleted = []
+        errors = []
+        
+        for filename in selected:
+            file_path = os.path.join(self.folder_path, filename)
+            try:
+                os.remove(file_path)
+                deleted.append(filename)
+            except Exception as e:
+                errors.append(f"{filename}: {str(e)}")
+        
+        result_msg = ""
+        if deleted:
+            result_msg += f"成功删除 {len(deleted)} 个文件\n"
+        if errors:
+            result_msg += f"删除失败 {len(errors)} 个文件：\n"
+            for err in errors[:5]:
+                result_msg += f"  - {err}\n"
+            if len(errors) > 5:
+                result_msg += f"  ... 还有 {len(errors) - 5} 个错误\n"
+        
+        if errors:
+            messagebox.showwarning("删除完成", result_msg)
+        else:
+            messagebox.showinfo("删除完成", result_msg)
+        
+        self._clear_manage_display()
+        self._clear_manage_detail()
+        self._manage_status_label.configure(text="删除完成，请重新加载文件")
+        
+        if self.similar_groups:
+            self._start_check_async()
     
     def _update_matcher_description(self, event=None):
         """更新匹配算法描述"""
@@ -410,6 +1154,7 @@ class MainWindow:
                 break
         
         self.similarity_calculator.set_matcher(matcher_type)
+        self._update_estimated_time()
     
     def _on_matcher_changed(self, event=None):
         """匹配算法改变时的回调"""
@@ -420,18 +1165,7 @@ class MainWindow:
         percentage = float(value) * 100
         self.threshold_value_label.configure(text=f"{percentage:.0f}%")
         self.similarity_calculator.threshold = float(value)
-        self._update_duplicate_threshold_label(self.duplicate_percent_var.get())
-    
-    def _update_duplicate_threshold_label(self, value):
-        """更新重复文件管理阈值显示"""
-        percent_value = float(value)
-        base_threshold = self.threshold_var.get() * 100
-        
-        actual_threshold = base_threshold + (100 - base_threshold) * (percent_value / 100)
-        
-        self.duplicate_threshold_value_label.configure(
-            text=f"实际：{actual_threshold:.0f}% ({percent_value:.0f}%)"
-        )
+        self._update_manage_threshold_label(self.manage_percent_var.get())
     
     def _browse_folder(self):
         """浏览选择文件夹"""
@@ -439,6 +1173,7 @@ class MainWindow:
         if folder_selected:
             self.folder_path = folder_selected
             self.folder_var.set(folder_selected)
+            self._update_estimated_time()
     
     def _progress_callback(self, progress: float):
         """
@@ -451,101 +1186,12 @@ class MainWindow:
         self.root.update()
     
     def _start_check(self):
-        """开始检测"""
-        if not self.folder_path or not os.path.exists(self.folder_path):
-            messagebox.showwarning("警告", "请先选择一个有效的文件夹")
-            return
-        
-        self.result_text.delete(1.0, tk.END)
-        self._clear_file_info()
-        self.progress_var.set(0)
-        self.status_label.configure(text="正在读取文件...")
-        self.root.update()
-        
-        self.similarity_calculator.include_extension = self.include_extension.get()
-        
-        try:
-            files = self.file_manager.get_files_in_folder(self.folder_path)
-        except Exception as e:
-            messagebox.showerror("错误", str(e))
-            self.status_label.configure(text="就绪")
-            return
-        
-        if len(files) < 2:
-            messagebox.showinfo("提示", "文件夹中文件数量不足，无法进行相似度检测")
-            self.status_label.configure(text="就绪")
-            return
-        
-        self.status_label.configure(text=f"共发现 {len(files)} 个文件，正在检测相似度...")
-        self.root.update()
-        
-        try:
-            self.similar_groups = self.similarity_calculator.find_groups(
-                files,
-                algorithm=self.algorithm_mode.get(),
-                progress_callback=self._progress_callback
-            )
-            
-            self._display_results()
-            
-            self.progress_var.set(100)
-            all_matchers = get_all_matchers()
-            matcher_name = self.matcher_type.get()
-            for m in all_matchers:
-                if m[0] == matcher_name:
-                    matcher_name = m[1]
-                    break
-            
-            threshold_text = f"{self.threshold_var.get() * 100:.0f}%"
-            self.status_label.configure(
-                text=f"检测完成！发现 {len(self.similar_groups)} 组相似文件（{matcher_name}，阈值：{threshold_text}）"
-            )
-            
-        except Exception as e:
-            messagebox.showerror("错误", f"检测过程中发生错误：{str(e)}")
-            self.status_label.configure(text="检测失败")
+        """开始检测（同步版本，保留兼容）"""
+        self._start_check_async()
     
     def _check_content_similarity(self):
-        """检测相同内容的文件"""
-        if not self.folder_path or not os.path.exists(self.folder_path):
-            messagebox.showwarning("警告", "请先选择一个有效的文件夹")
-            return
-        
-        self.result_text.delete(1.0, tk.END)
-        self._clear_file_info()
-        self.progress_var.set(0)
-        self.status_label.configure(text="正在读取文件内容并计算哈希...")
-        self.root.update()
-        
-        try:
-            files = self.file_manager.get_files_in_folder(self.folder_path)
-        except Exception as e:
-            messagebox.showerror("错误", str(e))
-            self.status_label.configure(text="就绪")
-            return
-        
-        if len(files) < 2:
-            messagebox.showinfo("提示", "文件夹中文件数量不足")
-            self.status_label.configure(text="就绪")
-            return
-        
-        try:
-            self.similar_groups = self.similarity_calculator.find_groups_by_content(
-                self.folder_path,
-                files,
-                progress_callback=self._progress_callback
-            )
-            
-            self._display_content_results()
-            
-            self.progress_var.set(100)
-            self.status_label.configure(
-                text=f"内容检测完成！发现 {len(self.similar_groups)} 组内容相同的文件"
-            )
-            
-        except Exception as e:
-            messagebox.showerror("错误", f"检测过程中发生错误：{str(e)}")
-            self.status_label.configure(text="检测失败")
+        """检测相同内容（同步版本，保留兼容）"""
+        self._check_content_async()
     
     def _display_content_results(self):
         """显示内容检测结果"""
@@ -692,6 +1338,7 @@ class MainWindow:
         self.similar_groups = []
         self.progress_var.set(0)
         self.status_label.configure(text="就绪")
+        self._timer_label.configure(text="")
     
     def _export_results(self):
         """导出检测结果到文本文件"""
@@ -769,27 +1416,3 @@ class MainWindow:
             
         except Exception as e:
             messagebox.showerror("错误", f"导出结果时发生错误：{str(e)}")
-    
-    def _open_duplicate_manager(self):
-        """打开重复文件管理器"""
-        if not self.folder_path or not os.path.exists(self.folder_path):
-            messagebox.showwarning("警告", "请先在「相似度检测」标签页选择一个有效的文件夹")
-            return
-        
-        base_threshold = self.threshold_var.get()
-        percent_value = self.duplicate_percent_var.get() / 100.0
-        actual_threshold = base_threshold + (1.0 - base_threshold) * percent_value
-        
-        manager = DuplicateManager(
-            self.root,
-            self.folder_path,
-            actual_threshold,
-            self.similarity_calculator,
-            self.file_manager,
-            self.style_manager
-        )
-        
-        manager.show()
-        
-        if self.similar_groups:
-            self._start_check()
